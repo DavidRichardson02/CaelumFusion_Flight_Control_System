@@ -80,6 +80,8 @@ The design is built as a set of explicit evidence producers feeding a single
 board-level integration top. Runtime controls select which evidence is live,
 which views are shown, and which diagnostics are intentionally injected.
 
+### High Level Architecture
+
 ```mermaid
 flowchart LR
     subgraph Board["Basys 3 Board Boundary"]
@@ -136,6 +138,239 @@ flowchart LR
     Science --> VGA
 ```
 
+
+### Architecture
+```mermaid
+flowchart TB
+    Top["caelumfusion_top_vga"]
+
+    %% ============================================================
+    %% Runtime control and inclusion policy
+    %% ============================================================
+    subgraph Runtime["Runtime controls and compile-time inclusion"]
+        Params["USE_* generics<br/>elaboration-time hardware inclusion"]
+        Buttons["Basys-3 buttons<br/>BTNC rst<br/>BTNU next page<br/>BTND previous page<br/>BTNR direct select"]
+        Switches["Basys-3 switches SW0-SW15<br/>arm, policy, self-test, bench, log, sensor gates, view gates, ext gates"]
+        ViewArb["caelumfusion_vga_direct_view_arbiter_sys<br/>arbitrates SW13:SW11 view ID vs bench/fault ownership"]
+        ViewState["view_sel_sys / cfg_invalid_view_sys<br/>HUD, compass, self-test, sensor diag, science pages"]
+    end
+
+    Top --> Params
+    Top --> Buttons
+    Top --> Switches
+    Buttons --> ViewArb
+    Switches --> ViewArb
+    ViewArb --> ViewState
+
+    %% ============================================================
+    %% Physical hardware and external producers
+    %% ============================================================
+    subgraph Hardware["Hardware and external producers"]
+        CMPS2["Pmod CMPS2 / MMC34160PJ<br/>JA3 scl, JA4 sda<br/>7-bit I2C addr 0x30"]
+        OptionalI2CDevices["Optional shared-I2C devices<br/>LIS3DH ACC, PMON1, HYGRO, GYRO, LIS2MDL MAG1"]
+        ADXL362Dev["ADXL362 SPI accelerometer<br/>optional SPI ACC source"]
+        GPIODev["Pmod GPIO / discrete inputs"]
+        TM4C["EK-TM4C123GXL LaunchPad<br/>UART1 PC5/U1TX J4.05<br/>fixed 22-byte packet producer"]
+        BenchStim["Synthetic bench/test stimulus<br/>self-test, MAG1 bench, injected faults"]
+        HostLogs["Host-side simulation / EKF / GPS / wind logs<br/>not synthesizable VGA payload today"]
+    end
+
+    %% ============================================================
+    %% SYS-domain acquisition producers
+    %% ============================================================
+    subgraph SysProducers["SYS-domain acquisition and producer modules"]
+        I2CSuite["rocket_i2c_suite_top"]
+        I2CJobCtl["i2c_job_mux + i2c_job_arbiter<br/>shared I2C job selection"]
+        MMCMagJob["mmc3416_i2c_job<br/>CMPS2 / MAG0 job<br/>probe, init, SET, measure, status poll, burst read"]
+        I2COptionalJobs["optional shared-I2C publication paths<br/>LIS3DH ACC, PMON1 PWR, HYGRO, GYRO, LIS2MDL MAG1"]
+        I2CSnapRegs["snapshot_regs<br/>I2C publication banks"]
+
+        SPISuite["rocket_spi_suite_top"]
+        SPISnapRegs["SPI snapshot publication banks<br/>ADXL362 ACC when included"]
+
+        GPIOCap["pmod_gpio_capture"]
+
+        UARTBridge["teensy_uart_range_bridge<br/>historical RTL name<br/>physical source is TM4C UART1"]
+        PacketIngress["teensy_bridge_packet_ingress<br/>A5 5A framed packet ingress"]
+        BridgeDiag["UART bridge diagnostics<br/>heartbeat age, range age, checksum fault,<br/>unsupported packet, stale heartbeat"]
+        RangeEvidence["rng_* evidence<br/>ext_rng_height_cm"]
+
+        BenchMag["mag1_bench_snapshot_source<br/>synthetic MAG1 source"]
+        ExtDiagSource["SW2 synthetic extension diagnostic source<br/>range, air, environment, sun, flow placeholders"]
+        FaultInject["snapshot_fault_injector<br/>deterministic diagnostic fault view"]
+        NavWind["landing_nav_wind_observer<br/>wind / dispersion evidence if synthesized"]
+    end
+
+    Top --> I2CSuite
+    Top --> SPISuite
+    Top --> GPIOCap
+    Top --> UARTBridge
+    Top --> BenchMag
+    Top --> FaultInject
+    Top --> ExtDiagSource
+    Top --> NavWind
+
+    Params --> I2CSuite
+    Params --> SPISuite
+    Params --> UARTBridge
+    Params --> BenchMag
+    Params --> FaultInject
+    Params --> ExtDiagSource
+    Params --> NavWind
+
+    Switches --> I2CSuite
+    Switches --> SPISuite
+    Switches --> UARTBridge
+    Switches --> BenchMag
+    Switches --> ExtDiagSource
+    Switches --> FaultInject
+    Switches --> NavWind
+
+    CMPS2 --> I2CSuite
+    OptionalI2CDevices --> I2CSuite
+    I2CSuite --> I2CJobCtl
+    I2CJobCtl --> MMCMagJob
+    I2CJobCtl --> I2COptionalJobs
+    MMCMagJob --> I2CSnapRegs
+    I2COptionalJobs --> I2CSnapRegs
+
+    ADXL362Dev --> SPISuite
+    SPISuite --> SPISnapRegs
+
+    GPIODev --> GPIOCap
+
+    TM4C --> UARTBridge
+    UARTBridge --> PacketIngress
+    PacketIngress --> BridgeDiag
+    BridgeDiag --> RangeEvidence
+
+    BenchStim --> BenchMag
+    BenchStim --> ExtDiagSource
+    BenchStim --> FaultInject
+
+    %% ============================================================
+    %% Snapshot model and derived state
+    %% ============================================================
+    subgraph SnapshotModel["SYS-domain raw snapshots and derived state"]
+        RawSnap["raw snapshot buses<br/>48-bit payload + timestamp + sequence + valid + status + freshness"]
+        DerState["derived_state_producer<br/>sensor decode, validity, freshness, heading inputs"]
+        AttMath["flight_attitude_math_sys<br/>attitude math and planar magnetic heading"]
+        DerSnap["derived snapshot buses<br/>altitude, vertical speed, attitude, heading, health metadata"]
+    end
+
+    I2CSnapRegs --> RawSnap
+    SPISnapRegs --> RawSnap
+    GPIOCap --> RawSnap
+    RawSnap --> DerState
+    DerState --> AttMath
+    AttMath --> DerSnap
+
+    %% ============================================================
+    %% Evidence aggregation, extension evidence, and logging
+    %% ============================================================
+    subgraph Evidence["Evidence aggregation and diagnostic logging"]
+        ExtHub["sensor_extension_hub<br/>range, air, environment, sun, flow,<br/>MAG1/PWR metadata, source flags"]
+        EvidenceView["selected evidence view<br/>normal or fault-injected diagnostic view"]
+        Blackbox["blackbox_frame_packer<br/>diagnostic frame request path<br/>version 0x02, 29 x 32-bit words"]
+        BlackboxOut["black-box telemetry words<br/>host decoder / evidence archive"]
+    end
+
+    RawSnap --> ExtHub
+    DerSnap --> ExtHub
+    RangeEvidence --> ExtHub
+    BenchMag --> ExtHub
+    ExtDiagSource --> ExtHub
+    NavWind --> ExtHub
+
+    RawSnap --> FaultInject
+    DerSnap --> FaultInject
+    ExtHub --> FaultInject
+    FaultInject --> EvidenceView
+    ExtHub --> EvidenceView
+
+    ExtHub --> Blackbox
+    Switches --> Blackbox
+    Blackbox --> BlackboxOut
+
+    %% ============================================================
+    %% SYS-to-PIX visualization publish
+    %% ============================================================
+    subgraph VizPublish["SYS-to-PIX visualization publication"]
+        VizModel["flight_viz_model_sys<br/>SYS-domain visualization model"]
+        VizCDC["flight_viz_bundle_cdc<br/>coherent SYS-to-PIX publish<br/>toggle synchronizers"]
+        VizSuite["flight_viz_suite_top"]
+    end
+
+    RawSnap --> VizModel
+    DerSnap --> VizModel
+    EvidenceView --> VizModel
+    NavWind --> VizModel
+    ViewState --> VizModel
+    VizModel --> VizCDC
+    VizCDC --> VizSuite
+
+    %% ============================================================
+    %% PIX-domain render path
+    %% ============================================================
+    subgraph Render["PIX-domain render path"]
+        RenderCtl["caelumfusion_vga_render_control<br/>page select, self-test, invalid-view handling"]
+        MainHud["flight_visualizer_pix<br/>main live telemetry HUD"]
+        Compass["planar_compass_truth_page_vga<br/>MAG / compass evidence page"]
+        Science["caelumfusion_science_page_vga<br/>explain, wind, integrity pages"]
+        VGAOut["VGA output<br/>hsync, vsync, rgb"]
+    end
+
+    VizSuite --> RenderCtl
+    ViewState --> RenderCtl
+    Switches --> RenderCtl
+
+    RenderCtl --> MainHud
+    RenderCtl --> Compass
+    RenderCtl --> Science
+
+    MainHud --> VGAOut
+    Compass --> VGAOut
+    Science --> VGAOut
+
+    %% ============================================================
+    %% Off-FPGA validation, host analysis, and release workflow
+    %% ============================================================
+    subgraph Validation["Off-FPGA validation, analysis, and release evidence"]
+        CMPS2TB["tb_mmc3416_i2c_job<br/>CMPS2 job simulation"]
+        I2CMuxTB["tb_mmc3416_i2c_mux_arbiter_continuation<br/>I2C mux / arbiter continuation simulation"]
+        TM4CPhase2["TM4C Phase 2 standalone UART validation<br/>PC5 idle-high, 115200 8N1, A5 5A packets"]
+        UARTDecoder["decode_tm4c_uart_packets.py<br/>WaveForms byte-export validator"]
+        BenchCaptures["bench captures<br/>I2C electrical, UART, VGA boot, stale/error behavior"]
+        SynthBase["synth_caelumfusion_top_vga.tcl"]
+        SynthTM4C["synth_caelumfusion_top_vga_tm4c_bridge.tcl"]
+        ImplBase["impl_caelumfusion_top_vga_from_synth.tcl"]
+        ReleaseGate["CaelumFusion L1 avionics release checklist<br/>timing, DRC, CDC, bench evidence, go/no-go"]
+        CanonCSV["flight_canonical.csv<br/>host-side EKF/GPS/wind telemetry boundary"]
+        LandingTool["landing_dispersion_envelope.py<br/>host-side SVG + summary"]
+    end
+
+    MMCMagJob -. verified by .-> CMPS2TB
+    I2CJobCtl -. verified by .-> I2CMuxTB
+    TM4C -. standalone evidence .-> TM4CPhase2
+    TM4CPhase2 -. byte export .-> UARTDecoder
+    UARTBridge -. FPGA-connected UART evidence .-> BenchCaptures
+    CMPS2 -. I2C electrical and 10 Hz MAG evidence .-> BenchCaptures
+    VGAOut -. visualization evidence .-> BenchCaptures
+
+    Top -. baseline build .-> SynthBase
+    Top -. TM4C bridge build .-> SynthTM4C
+    SynthBase --> ImplBase
+    SynthTM4C --> BenchCaptures
+    ImplBase --> ReleaseGate
+    BenchCaptures --> ReleaseGate
+    CMPS2TB --> ReleaseGate
+    I2CMuxTB --> ReleaseGate
+    UARTDecoder --> ReleaseGate
+
+    HostLogs --> CanonCSV
+    CanonCSV --> LandingTool
+
+
 ### Canonical Module Hierarchy
 
 The project is intentionally organized around a board-facing integration top.
@@ -190,6 +425,8 @@ flowchart TB
     RenderCtl --> Compass
     RenderCtl --> Science
 ```
+
+
 
 ### Evidence Pipeline
 
