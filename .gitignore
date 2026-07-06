@@ -1,0 +1,57 @@
+# Local agent/runtime metadata
+.agents/
+.codex/
+.codex_build/
+-p/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Vivado generated state
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+xsim.dir/
+tmp/
+
+# Vivado logs, journals, databases, reports, and checkpoints
+*.jou
+*.log
+*.str
+*.pb
+*.wdb
+*.rpt
+*.dcp
+*.edf
+*.edn
+*.mmi
+*.sdf
+*.saif
+*.vcd
+*.backup.*
+clockInfo.txt
+dfx_runtime.txt
+
+# FPGA programming outputs
+*.bit
+*.bin
+*.ltx
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Generated documentation builds
+docs/build/
+
+# Local/vendor reference archives inspected before publishing.
+# Keep source-of-truth RTL, constraints, tools, firmware, and hand-authored docs
+# in the repository; keep bulky third-party reference material out by default.
+Basys-3 Pmods/
+CaelumSufflamenVerilog/
