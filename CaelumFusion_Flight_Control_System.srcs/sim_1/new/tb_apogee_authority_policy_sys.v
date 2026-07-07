@@ -35,12 +35,15 @@ module tb_apogee_authority_policy_sys;
     apogee_authority_policy_sys #(
         .TARGET_APOGEE_CM(32'd304800),
         .MAX_BMP_AGE_MS(16'd200),
+        .SYS_CLK_HZ(100),
+        .POLICY_UPDATE_HZ(50),
         .POLICY_MIN_ALT_CM(32'd3000),
         .POLICY_MIN_VSPD_CMS(32'sd1500),
         .POLICY_DEADBAND_CM(32'd500),
-        .UNC_BASE_CM(32'd100),
-        .UNC_MAX_CM(32'd2000),
-        .UNC_AGE_CM_PER_MS(8'd0)
+        .POLICY_SLEW_U8_PER_SEC(16'd383),
+        .POLICY_P00_FALLBACK_CM2(32'd10000),
+        .POLICY_SIGMA_MARGIN_Q8(16'd256),
+        .UNC_MAX_CM(32'd2000)
     ) dut (
         .sys_clk(clk),
         .sys_rst(rst),
@@ -69,7 +72,7 @@ module tb_apogee_authority_policy_sys;
 
     task settle;
         begin
-            repeat (8) @(posedge clk);
+            repeat (12) @(posedge clk);
         end
     endtask
 
@@ -106,6 +109,14 @@ module tb_apogee_authority_policy_sys;
                 $display("FAIL %0s: servo still idle", name);
                 $fatal;
             end
+            if (auth_uncertainty_cm !== 16'd100) begin
+                $display("FAIL %0s: expected sqrt(P00)=100 cm margin, got %0d", name, auth_uncertainty_cm);
+                $fatal;
+            end
+            if (auth_target_cm !== 32'd304700) begin
+                $display("FAIL %0s: expected effective target 304700 cm, got %0d", name, auth_target_cm);
+                $fatal;
+            end
         end
     endtask
 
@@ -125,6 +136,8 @@ module tb_apogee_authority_policy_sys;
             software_armed = 1'b1;
         end
     endtask
+
+    reg [7:0] first_cmd;
 
     initial begin
         rst = 1'b1;
@@ -179,6 +192,20 @@ module tb_apogee_authority_policy_sys;
         set_nominal();
         settle();
         expect_command("valid_coast_command");
+        first_cmd = auth_brake_cmd_u8;
+
+        // Gate failure must reset private slew memory to zero rather than
+        // resuming from a stale pre-denial command.
+        software_armed = 1'b0;
+        settle();
+        expect_idle("gate_failure_resets_slew_memory");
+
+        set_nominal();
+        repeat (6) @(posedge clk);
+        if (auth_brake_cmd_u8 >= first_cmd) begin
+            $display("FAIL slew restart: command did not restart from a lower value, old=%0d new=%0d", first_cmd, auth_brake_cmd_u8);
+            $fatal;
+        end
 
         $display("PASS tb_apogee_authority_policy_sys");
         $finish;
