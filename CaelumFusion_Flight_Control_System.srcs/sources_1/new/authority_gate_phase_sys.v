@@ -17,7 +17,8 @@
 //     evidence agree that launch is underway.
 //   - COAST follows BOOST after a bounded dwell.
 //   - BRAKE is entered only in a healthy armed/policy-enabled coast window.
-//   - DESCENT latches after a downward vertical-speed threshold.
+//   - DESCENT latches after a downward vertical-speed threshold and remains
+//     latched until reset, matching the firmware flight_phase_reset contract.
 //
 // This is still an evidence-level FSM, not a calibrated flight computer. The
 // final servo pulse remains owned by apogee_authority_policy_sys; this module
@@ -35,7 +36,7 @@ module authority_gate_phase_sys #(
     parameter integer LAUNCH_VSPD_THRESH_CMS = 250,
     parameter integer LAUNCH_ALT_DELTA_CM    = 100,
     parameter integer BRAKE_MIN_ALT_AGL_CM   = 500,
-    parameter integer BOOST_MIN_CYCLES       = 5_000_000,
+    parameter integer BOOST_MIN_CYCLES       = 25_000_000,
 
     parameter [15:0] BMP_MAX_AGE_MS = `BMP_FRESH_MAX_MS,
     parameter [15:0] ACC_MAX_AGE_MS = `ACC_FRESH_MAX_MS,
@@ -190,8 +191,16 @@ module authority_gate_phase_sys #(
             (boost_cycle_count_r >= BOOST_MIN_CYCLES_U32);
 
         if (!runtime_ok_w) begin
-            phase_state_next       = `VIZ_AUTH_PHASE_UNKNOWN;
+            // Firmware parity: before launch, invalid evidence is fail-safe IDLE;
+            // after launch, transient invalidity must not erase flight history.
             boost_cycle_count_next = 32'd0;
+            case (phase_state_r)
+                `VIZ_AUTH_PHASE_BOOST,
+                `VIZ_AUTH_PHASE_COAST,
+                `VIZ_AUTH_PHASE_BRAKE,
+                `VIZ_AUTH_PHASE_DESCENT: phase_state_next = phase_state_r;
+                default: phase_state_next = `VIZ_AUTH_PHASE_IDLE;
+            endcase
         end else begin
             case (phase_state_r)
                 `VIZ_AUTH_PHASE_UNKNOWN: begin
@@ -252,10 +261,11 @@ module authority_gate_phase_sys #(
 
                 `VIZ_AUTH_PHASE_DESCENT: begin
                     boost_cycle_count_next = 32'd0;
-                    if (near_ground_w)
-                        phase_state_next = `VIZ_AUTH_PHASE_IDLE;
-                    else
-                        phase_state_next = `VIZ_AUTH_PHASE_DESCENT;
+                    // Firmware parity: descent is a latched in-flight state.
+                    // Returning to IDLE requires reset rather than near-ground
+                    // samples, which prevents phase chatter or accidental
+                    // history erasure during recovery/landing telemetry.
+                    phase_state_next = `VIZ_AUTH_PHASE_DESCENT;
                 end
 
                 default: begin
@@ -301,9 +311,12 @@ module authority_gate_phase_sys #(
                 ground_altitude_valid_r <= 1'b1;
             end
 
-            auth_phase_code        <= runtime_ok_w ? phase_state_next :
-                                                       `VIZ_AUTH_PHASE_UNKNOWN;
-            auth_phase_valid       <= phase_valid_w;
+            auth_phase_code        <= phase_state_next;
+            // Before launch, invalid inputs still publish a known fail-safe IDLE
+            // phase; after launch, phase remains meaningful even if freshness
+            // checks temporarily fail.
+            auth_phase_valid       <= runtime_ok_w ||
+                                      (phase_state_next != `VIZ_AUTH_PHASE_IDLE);
             safety_runtime_ok      <= runtime_ok_w;
             safety_allows_actuation <= safety_allows_w;
             policy_runtime_enable  <= policy_enable_w;
